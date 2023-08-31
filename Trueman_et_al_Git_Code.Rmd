@@ -1,0 +1,769 @@
+---
+title: "Tuna otolith FMR "
+author: "Clive Trueman"
+date: "25/02/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+``````{r, echo=FALSE, warning=FALSE, fig.height = 7, fig.width = 7, fig.align = "center"}
+
+library(ggplot2)
+library(plyr)
+library(gridExtra)
+library(segmented)
+library(tidyverse)
+library(patchwork)
+library(ggsci)
+library(svMisc)
+library(ggsci)
+
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+```
+
+
+#Suess effect correction for tuna -0.025 per year (Rooker Science)
+```{r, echo=FALSE}
+SuessCor<- -0.025
+```
+
+
+# different d18Owater values 
+
+```{r, echo=FALSE}
+d18Ow<-1 # global average
+#first guess water / DIC
+d18OwMed <-1.2 #Med - (+/- 0.5?)
+d18OwGOM <-1 #GOM - (+/- 0.25?)
+
+```
+
+# different d13C DIC values (gloabl, Med, GOM, unassigned)
+
+```{r, echo=FALSE}
+d13C_DIC<-1.5 # global average
+d13C_DICMed <- 1 #Med - (+/- 0.5?)
+d13C_DICGOM <- 1 #GOM - (+/- 0.5?)
+d13C_DIC_Unassign <- 1 #GOM - (+/- 0.5?)
+```
+
+## Data load
+
+
+
+```{r, echo=FALSE}
+setwd("")
+data<-read.csv("BFT_FMR.csv", header = TRUE, fill=TRUE)
+
+```
+
+#### supp fig plot (proportion from western origin by year)
+
+
+
+summary <- data %>%
+ filter(age_group %in% c("post_2yr", "post_2yr_3Mo")) %>%
+  filter(caught_EW !="Unknown") %>%
+  group_by(yearclass, caught_EW) %>%
+  summarize(Gom_Count = sum(Origen == "Gom"),
+            Med_Count = sum(Origen == "Med")) %>%
+  mutate(TotalCount = Gom_Count + Med_Count,
+         Gom_Proportion = Gom_Count / TotalCount,
+         Med_Proportion = Med_Count / TotalCount) %>%
+  ungroup()
+  
+  
+summary$caught_EW <- factor(summary$caught_EW, levels = c("East", "West", "Unknown", "Central"))  
+ggplot(summary, aes(x = yearclass, y = Gom_Proportion, size = Gom_Count, color=caught_EW)) +
+    scale_color_npg(breaks = c("East", "West", "Central")) +  # Specify the desired order of categories
+  geom_point() +
+ 
+  geom_smooth(method = "lm", se = TRUE, alpha=0.2, lwd=2) +
+  guides(size = guide_legend(title = "Number of fish"))+
+  theme(axis.text.x = element_text(size = 20)) +
+    theme(axis.text.y = element_text(size = 20)) +
+  theme(axis.title.x = element_text(size = 24))  +
+  theme(axis.title.y = element_text(size = 24)) +
+  theme(panel.background = element_rect(fill = "white"))  +
+  theme(panel.background = element_rect(colour = "black"))  +
+  theme(strip.background = element_rect(fill = "white"))   +
+  theme(legend.position = c(0.8, 0.8))+
+    theme(
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 24)
+  )+
+    labs(x = "Year Class", y = "Proportion of Fish Assigned to the Western Population", color = "Capture Origin") 
+
+
+#Suess correct to latest year in dataset to date (2019 in AZTI dataset)
+
+```{r, echo=FALSE}
+
+yearRef<-2019
+data$cor<-yearRef-data$yearclass
+data$d13Cs<-(data$cor*SuessCor)+data$d13C
+
+#Suess correct DIC estimates (model year 2019)# correct to 2019 from DIC data not year of capture
+# Code allows application of different water d18O to east and west
+data['d13C_DIC']<-NA
+data$d13C_DIC[data$Origen=="Gom"]<-d13C_DICMed
+data$d13C_DIC[data$Origen=="Med"]<-d13C_DICGOM
+data$d13C_DIC[data$Origen=="Unassigned"]<-d13C_DIC_Unassign
+
+
+data['d18Ow']<-NA
+data$d18Ow[data$Origen=="Gom"]<-d18OwMed
+data$d18Ow[data$Origen=="Med"]<-d18OwGOM
+data$d18Ow[data$Origen=="Unassigned"]<-d18Ow
+
+
+
+```
+#  estimate for diet DIC 
+
+```{r, echo=FALSE}
+diet<- -18.5 #(±0.5)
+
+
+```
+
+ removing data with NA in year class
+```{r, echo=FALSE}
+data$yearclass<-as.factor(data$yearclass)
+data<-data%>%drop_na(yearclass)
+```
+
+
+
+
+## set up for MC resampling
+```{r, echo=FALSE}
+
+#data<-na.omit(data)
+
+
+## set up for MC resampling
+# estimates of uncertainty
+d13C_diet_SD<-0.25 #95% CI range  = 1 per mille
+d13Cs_SD<-0.1 #95% CI range  = 0.4 per mille
+d13C_DIC_SD<-0.1 #95% CI range  = 0.4 per mille
+
+d18Ow_SD<-0.05 #95% CI range  = 0.2 per mille
+d18Ooto_SD<-0.025 #95% CI range  = 0.2 per mille
+temp_slope_SD<-0.004#0.04475# estimate, justify, Hoie - 95% range = 0.019
+temp_int_SD<-0.03#0.06 = high, 0.03 = low estimate, justify, Hoie  95% range = 0.24
+
+
+# function for replicate estimates of Cresp + temp
+# reps
+# output matrix (MC_out)
+# individual values of d13Coto, d13C_diet and d13C_DIC and linked uncertainty
+# individual values of d18Ooto, d18Ow, slope, intercept and linked uncertainty
+# matrix to save rep values into - repeating individual by reps in column
+# matrix variables: ID, lifestage, origin, year
+
+  N_inds<-length(data$code)
+  count=1
+  reps=100
+
+  
+ MC_out<-data.frame(matrix(ncol=10,nrow=reps*N_inds, dimnames=list(NULL, c("ID", "Lifestage", "Origin", "Year", "Caught_EW", "Temperature", "Cresp", "Data_owner", "Months_sampled", "Iteration"))))
+
+ 
+
+ 
+  # loop over (rep No) draws with common temp equation slope and intercept for each individual create vectors of [N-inds] lengths with estimates of Cresp and Temp
+for (draw in 1:reps){
+  progress(draw, progress.bar=TRUE)
+  slope<-rnorm(mean=-0.27, sd=temp_slope_SD, 1)
+  int<-rnorm(mean=-5.193, sd=temp_int_SD, 1)
+  position<-draw*N_inds
+  
+
+  
+for (ind in 1:N_inds){
+  d13C_diet_ct<-rnorm(mean=diet, sd=d13C_diet_SD, 1)
+  d13C_DIC_ct<-rnorm(mean=data$d13C_DIC[ind], sd=d13C_DIC_SD, 1)
+  d13Cs_ct<-rnorm(mean=data$d13Cs[ind], sd=d13Cs_SD, 1)
+  Cresp<-1-((d13C_diet_ct-d13Cs_ct) / (d13C_diet_ct- d13C_DIC_ct))
+  iteration<-draw
+  d18Ow_ct<-rnorm(mean=data$d18Ow[ind], sd=d18Ow_SD, 1)
+  d18Ooto_ct<-rnorm(mean=data$d18O[ind], sd=d18Ooto_SD, 1)
+  Temperature<-((d18Ooto_ct- d18Ow_ct)+int)/slope
+  
+  MC_out$Temperature[(position-N_inds)+ind]<- Temperature
+  MC_out$Cresp[(position-N_inds)+ind]<- Cresp
+  MC_out$Iteration[(position-N_inds)+ind]<- iteration
+   MC_out$ID[(position-N_inds)+ind]<- data$code[ind]
+    MC_out$Lifestage[(position-N_inds)+ind]<- data$age_group[ind]
+     MC_out$Origin[(position-N_inds)+ind]<- data$Origen[ind]
+      MC_out$Year[(position-N_inds)+ind]<- data$year[ind]
+      MC_out$Caught_EW[(position-N_inds)+ind]<- data$caught_EW[ind]
+      MC_out$Data_owner[(position-N_inds)+ind]<- data$Data_owner[ind]
+      MC_out$Months_sampled[(position-N_inds)+ind]<- data$months_sampled[ind]
+
+}
+}
+  
+
+
+
+
+
+
+
+
+```
+
+
+# what is the mean std dev of MC resampled Cresp and temp values?
+``````{r, echo=FALSE, warning=FALSE, fig.height = 7, fig.width = 7, fig.align = "center"}
+test<-MC_out%>%
+    group_by(ID)%>%
+    summarise(sd(Cresp), sd(Temperature))
+    
+MeanStdDevCresp<-mean(test$"sd(Cresp)", na.rm=TRUE)
+MeanStdDevTemp<-mean(test$"sd(Temperature)", na.rm=TRUE)
+CI_range_Cresp<-4*MeanStdDevCresp
+CI_range_Temp<-4*MeanStdDevTemp
+
+CI_range_Cresp
+CI_range_Temp
+````
+
+``````{r, echo=FALSE, warning=FALSE, fig.height = 7, fig.width = 7, fig.align = "center"}
+
+## Using linear mean equation from Chung et al 2018  Cresp<- 4.01+(0.000971*O2)
+MC_out$O2_consumption<-(MC_out$Cresp-0.041)/0.000971
+MC_out$Temperature2<-MC_out$Temperature^2
+
+neworder <- c("sub_yearling","yearling","post_2yr_3", "post_2yr")
+neworder2 <- c("East","West","Central")
+MC_out <- arrange(transform(MC_out,
+             Lifestage=factor(Lifestage,levels=neworder)),Lifestage) 
+             
+MC_out <- arrange(transform(MC_out,
+             Caught_EW=factor(Caught_EW,levels=neworder2)),Caught_EW) 
+ 
+ 
+
+MC_out$iTemp<-as.integer(MC_out$Temperature)
+MC_out$Temperature2<-MC_out$Temperature^2
+
+```
+
+
+
+
+
+
+
+## Master Fig 2 output plot: Cresp vs Temperature -all data -split by age
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+
+xlabT <- "Temperature (°C)"
+ylabO2 <- "Oxygen consumption (mgO2/Kg/Hr)"
+
+AZTI_All_TempCresp_Caught<- ggplot(MC_out, aes(Temperature, Cresp, color=Caught_EW), show.legend = FALSE)+
+  scale_color_npg()+
+  geom_point(shape=".", size=0.05, show.legend = FALSE)+
+
+
+  theme(axis.text.y = element_text(size = 12)) +
+  ylim(0.4, 0.7)+
+  xlim(22,33)+
+  theme(axis.text.x = element_text(size = 16)) +
+  theme(axis.title.x = element_text(size = 18))  +
+  theme(axis.title.y = element_text(size = 18)) +
+  theme(panel.background = element_rect(fill = "white"))  +
+  theme(panel.background = element_rect(colour = "black"))  +
+  theme(strip.background = element_rect(fill = "white"))   +
+  ylab(expression(C[resp]~(Field~Metabolic~Rate))) + 
+  labs(x = xlabT)+
+  labs(y=(bquote(C[resp])))
+
+
+#  Same plot but color by origin
+AZTI_All_TempCresp_Origin<- ggplot(MC_out, aes(Temperature, Cresp, color=Origin), show.legend = FALSE)+
+  scale_color_npg()+
+  geom_point(shape=".", size=0.05, show.legend = FALSE)+
+
+
+  theme(axis.text.y = element_text(size = 12)) +
+  ylim(0.4, 0.7)+
+  xlim(22,33)+
+  theme(axis.text.x = element_text(size = 16)) +
+  theme(axis.title.x = element_text(size = 18))  +
+  theme(axis.title.y = element_text(size = 18)) +
+  theme(panel.background = element_rect(fill = "white"))  +
+  theme(panel.background = element_rect(colour = "black"))  +
+  theme(strip.background = element_rect(fill = "white"))   +
+  ylab(expression(C[resp]~(Field~Metabolic~Rate))) + 
+  labs(x = xlabT)+
+  labs(y=(bquote(C[resp])))
+
+```
+
+
+
+
+
+
+
+## quadratic and breakpoint analyses
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+
+# extract the quadratic fit coefficients - write as function -  apply over iterations (i.e. recover 100 estimates of vertex / breakpoint) -save vector of breakpoints to plot as density plot.
+
+Quad_Func <- function(z) {
+
+
+  model <- lm(Cresp ~ Temperature+Temperature2, z) # Linear model
+  vtx<- (-coefficients(model)[2])/(2*(coefficients(model)[3])) # extract vertex
+return(vtx)
+}
+
+
+
+
+
+quadfit<-lm(Cresp~Temperature+Temperature2, data=MC_out)
+vertex<- (-coefficients(quadfit)[2])/(2*(coefficients(quadfit)[3]))
+
+
+quadfit_subYr<-lm(Cresp[Lifestage=="sub_yearling"]~Temperature[Lifestage=="sub_yearling"]+Temperature[Lifestage=="sub_yearling"], data=MC_out)
+vertex_subYr<- (-coefficients(quadfit_subYr)[2])/(2*(coefficients(quadfit_subYr)[3]))
+
+quadfit_Yr<-lm(Cresp[Lifestage=="yearling"]~Temperature[Lifestage=="yearling"]+Temperature2[Lifestage=="yearling"], data=MC_out)
+vertex_Yr<- (-coefficients(quadfit_Yr)[2])/(2*(coefficients(quadfit_Yr)[3]))
+
+quadfit_2Yr_3<-lm(Cresp[Lifestage=="post_2yr_3"]~Temperature[Lifestage=="post_2yr_3"]+Temperature2[Lifestage=="post_2yr_3"], data=MC_out)
+vertex_2Yr_3<- (-coefficients(quadfit_2Yr_3)[2])/(2*(coefficients(quadfit_2Yr_3)[3]))
+
+quadfit_2Yr<-lm(Cresp[Lifestage=="post_2yr"]~Temperature[Lifestage=="post_2yr"]+Temperature2[Lifestage=="post_2yr"], data=MC_out)
+vertex_2Yr<- (-coefficients(quadfit_2Yr)[2])/(2*(coefficients(quadfit_2Yr)[3]))
+
+```
+
+
+
+
+
+## Change point analyses to explore thermal limitation - using package segmented (https://cran.r-project.org/web/packages/segmented/segmented.pdf) to fit slopes  https://rdrr.io/cran/segmented/man/plot.segmented.html.
+
+
+
+
+#start with a linear model of Cresp vs temp for all data
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+
+data_breakpoint<-MC_out %>%
+  filter(Year%in%c(1996:2010, 2012, 2017))
+
+lm1<-lm(Cresp ~ Temperature, data=data_breakpoint) # have to provide estimates for breakpoints.
+
+my.seg <- segmented(lm1, 
+                    seg.Z = ~Temperature, 
+                    psi = 25)
+
+# display the summary
+summary(my.seg)
+
+# plot as ggplot
+fit <- numeric(length(data_breakpoint$Temperature)) * NA
+fit[complete.cases(rowSums(cbind(data_breakpoint$Cresp, data_breakpoint$Temperature)))] <- broken.line(my.seg)$fit
+
+
+
+
+```
+
+
+Apply the segmented model to each age group, return the slopes and breakpoints in a table 
+
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+
+
+breakpoint_Func <- function(z) {
+
+
+  model <- lm(Cresp ~ Temperature, z) # Linear model
+  seg_mod <- segmented(model, seg.Z = ~Temperature, 
+                    control=seg.control(alpha=0.25)) # Segmented model
+  breakpoint <- as.matrix(seg_mod$psi[2]) # Extract breakpoint
+  coefficients <- as.matrix(seg_mod$coefficients) # Extract coefficients
+  dt<-davies.test(model, ~Temperature, k = 10, alternative = c("two.sided", "less", "greater"), 
+    type=c("lrt","wald"), values=NULL, dispersion=NULL)
+  summary_curve1 <- as.data.frame(rbind(breakpoint, coefficients, dt$p.value)) 
+  varnames<-c("breakpoint","intercept", "Seg1_slope", "Seg2_slope", "NULL", "daviesP")
+  summary_curve1 <-cbind(varnames, summary_curve1)
+
+return(summary_curve1)
+}
+
+```
+
+Breakpoint by age class
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+AgeBreak <- ddply(data_breakpoint, .(Lifestage), breakpoint_Func)
+
+AgeBreak_wide<-pivot_wider(AgeBreak, names_from = varnames, values_from = V1) 
+
+
+
+ age_N<-data %>%
+    group_by(age_group) %>%
+    summarize(n_fish = n())
+    
+    
+    ```
+    
+    what proportion of post 2yr fish have Temp>28?
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+# remove data with NA in ageclass
+dataMC<-MC_out %>% drop_na(c(Lifestage, Temperature, Origin))
+
+All28<-dataMC %>%
+    summarize(n_fish = n(),
+              n_gt28 = sum(Temperature > 28),
+              p_gt28 = n_gt28 / n_fish)
+
+Prop28<-dataMC %>%
+    group_by(Lifestage) %>%
+    summarize(n_fish = n(),
+              n_gt28 = sum(Temperature > 28),
+              p_gt28 = n_gt28 / n_fish)
+````
+
+Estimate Cresp inter quartile range and experienced temperature mode
+
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+### range analysis
+
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+
+#population summary all lifestage
+sampleDataAll<-MC_out %>%
+  group_by(iTemp) %>%
+  summarize (
+    CrespMin = min(Cresp, na.rm=TRUE),
+    CrespMax = max(Cresp, na.rm=TRUE),
+    CrespIQR = IQR(Cresp, na.rm=TRUE),
+    CrespQ25 = quantile(Cresp, probs=0.25, na.rm=TRUE),
+    CrespQ75 = quantile(Cresp, probs=0.75, na.rm=TRUE),
+    CrespSd = sd(Cresp, na.rm=TRUE),
+    Number = n(),
+    CrespMean = mean(Cresp, na.rm=TRUE))
+
+sampleDataAll$diff<-sampleDataAll$CrespMax-sampleDataAll$CrespMin
+
+sampleDataAll%>% print(n = Inf)
+
+
+
+
+
+
+
+#population summary group by lifestage
+sampleData<-MC_out %>%
+  group_by(Lifestage, iTemp) %>%
+  summarize (
+    CrespMin = min(Cresp, na.rm=TRUE),
+    CrespMax = max(Cresp, na.rm=TRUE),
+    CrespIQR = IQR(Cresp, na.rm=TRUE),
+    CrespQ25 = quantile(Cresp, probs=0.25, na.rm=TRUE),
+    CrespQ75 = quantile(Cresp, probs=0.75, na.rm=TRUE),
+    CrespSd = sd(Cresp, na.rm=TRUE),
+    Number = n(),
+    CrespMean = mean(Cresp, na.rm=TRUE))
+
+sampleData$diff<-sampleData$CrespMax-sampleData$CrespMin
+
+sampleData%>% print(n = Inf)
+
+# remove low number observations to compare IQR
+SampleDataN_15<-filter(sampleData, Number > 1500)
+
+
+
+# SD over iterations
+
+
+#population summary all lifestage
+sampleDataAll_iterate<-MC_out %>%
+  group_by(Iteration, Lifestage, iTemp) %>%
+  summarize (
+    CrespMin = min(Cresp, na.rm=TRUE),
+    CrespMax = max(Cresp, na.rm=TRUE),
+    CrespIQR = IQR(Cresp, na.rm=TRUE),
+    CrespQ25 = quantile(Cresp, probs=0.25, na.rm=TRUE),
+    CrespQ75 = quantile(Cresp, probs=0.75, na.rm=TRUE),
+    CrespSd = sd(Cresp, na.rm=TRUE),
+    Number = n(),
+    CrespMean = mean(Cresp, na.rm=TRUE))
+
+ModeT_SD<-sampleDataAll_iterate %>% group_by(Iteration, Lifestage) %>% 
+summarise((iTemp[which.max(Number)]))
+sd(unlist(ModeT_SD[3]))
+
+yearling<-ModeT_SD%>%
+filter(Lifestage=="yearling")
+sd(unlist(yearling[3]))
+
+sub_yearling<-ModeT_SD%>%
+filter(Lifestage=="sub_yearling")
+sd(unlist(sub_yearling[3]))
+
+
+post_2yr_3<-ModeT_SD%>%
+filter(Lifestage=="post_2yr_3")
+sd(unlist(post_2yr_3[3]))
+
+post_2yr<-ModeT_SD%>%
+filter(Lifestage=="post_2yr")
+sd(unlist(post_2yr[3]))
+
+
+
+# SD over iterations
+
+
+#population summary all lifestage
+sampleData_iterate<-MC_out %>%
+  group_by(Iteration, Lifestage, iTemp) %>%
+  summarize (
+    CrespMin = min(Cresp, na.rm=TRUE),
+    CrespMax = max(Cresp, na.rm=TRUE),
+    CrespIQR = IQR(Cresp, na.rm=TRUE),
+    CrespQ25 = quantile(Cresp, probs=0.25, na.rm=TRUE),
+    CrespQ75 = quantile(Cresp, probs=0.75, na.rm=TRUE),
+    CrespSd = sd(Cresp, na.rm=TRUE),
+    Number = n(),
+    CrespMean = mean(Cresp, na.rm=TRUE))
+
+CrespIQR_SD<-sampleData_iterate %>% group_by(Iteration, Lifestage) %>% 
+summarise((iTemp[which.max(CrespIQR)]))
+sd(unlist(CrespIQR[3]))
+
+yearling<-CrespIQR_SD%>%
+filter(Lifestage=="yearling")
+sd(unlist(yearling[3]))
+
+sub_yearling<-CrespIQR_SD%>%
+filter(Lifestage=="sub_yearling")
+sd(unlist(sub_yearling[3]))
+
+
+post_2yr_3<-CrespIQR_SD%>%
+filter(Lifestage=="post_2yr_3")
+sd(unlist(post_2yr_3[3]))
+
+post_2yr<-CrespIQR_SD%>%
+filter(Lifestage=="post_2yr")
+sd(unlist(post_2yr[3]))
+````
+
+
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+
+
+# extract the CrespIQR and mode Temp values and build into a vector
+
+CrespIQRT<-SampleDataN_15 %>% group_by(Lifestage) %>% summarise(iTemp[which.max(CrespIQR)])
+Cresp_IQRT<-c(pull(sampleDataAll%>% summarise(iTemp[which.max(CrespIQR)])),pull(CrespIQRT))
+
+
+ModeT<-SampleDataN_15 %>% group_by(Lifestage) %>% summarise(iTemp[which.max(Number)])
+T_pref.<-c(pull(sampleDataAll%>% summarise(iTemp[which.max(Number)])),pull(ModeT))
+
+
+
+
+####  Create table for outputs
+
+
+
+
+Age_Group<-c("All", "Age 0", "Yearling", "Post 2 year 3 month", "Post 2 year")
+N<-c(N_inds, as.numeric(c(age_N[3,2], age_N[4,2], age_N[2,2],age_N[1,2])))
+P28<-signif(as.numeric(c(All28[1,3], Prop28[1,4],  Prop28[2,4], Prop28[3,4], Prop28[4,4])), 2)
+BreakT<-signif(as.numeric(c(Break_all_data[1,2], AgeBreak_wide[1,2], AgeBreak_wide[2,2], AgeBreak_wide[3,2], AgeBreak_wide[4,2])), 3)
+Slope_low<-signif(as.numeric(c(Break_all_data[3,2], AgeBreak_wide[1,4], AgeBreak_wide[2,4], AgeBreak_wide[3,4], AgeBreak_wide[4,4])), 3)
+Slope_high<-signif(as.numeric(c(Break_all_data[4,2], AgeBreak_wide[1,5], AgeBreak_wide[2,5], AgeBreak_wide[3,5], AgeBreak_wide[4,5])), 3)
+DaviesP<-signif(as.numeric(c(Break_all_data[6,2], AgeBreak_wide[1,7], AgeBreak_wide[2,7], AgeBreak_wide[3,7], AgeBreak_wide[4,7])), 3)
+VertexT<-signif(as.numeric(c(vertex, vertex_subYr, vertex_Yr, vertex_2Yr_3, vertex_2Yr)), 2)
+
+
+#R2<-rep("NA",6)
+
+
+
+Table1<-cbind(Age_Group, N, T_pref., Cresp_IQRT, VertexT, BreakT, Slope_low, Slope_high, DaviesP)
+
+kbl(Table1)%>%
+  kable_classic_2("striped", full_width = F)
+  #column_spec(4, color = spec_color(Table$VertexT[1:5]),
+            #  link = "https://haozhu233.github.io/kableExtra/") %>%
+  column_spec(5, color = "white",
+              background = spec_color(Table$BreakT[1:5], end = 31))
+
+```
+
+  
+build the repeat models by iteration
+  
+Breakpoint by iteration
+
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+breakpoint_Func_Iterate <- function(z) {
+
+
+  model <- lm(Cresp ~ Temperature, z) # Linear model
+  seg_mod <- segmented(model, seg.Z = ~Temperature, 
+                    control=seg.control(alpha=0.25)) # Segmented model
+  breakpoint <- as.matrix(seg_mod$psi[2]) # Extract breakpoint
+
+return(breakpoint)
+}
+
+IterationBreak <- ddply(data_breakpoint, .(Iteration, Lifestage), breakpoint_Func_Iterate)
+# extract the std deviation around the vertices for each life stage
+IterationBreakSD <- IterationBreak  %>%
+#  group_by(Lifestage) %>%
+  summarize(Standard_Deviation = sd(unlist(IterationBreak[3])))
+IterationBreakSD 
+
+
+
+
+yearlingBP<-IterationBreak%>%
+filter(Lifestage=="yearling")
+sd(unlist(yearling[3]))
+
+sub_yearling<-IterationBreak%>%
+filter(Lifestage=="sub_yearling")
+sd(unlist(sub_yearling[3]))
+
+
+post_2yr_3<-IterationBreak%>%
+filter(Lifestage=="post_2yr_3")
+sd(unlist(post_2yr_3[3]))
+
+post_2yr<-IterationBreak%>%
+filter(Lifestage=="post_2yr")
+sd(unlist(post_2yr[3]))
+
+
+
+
+
+```
+  
+Vertex by iteration <- bind vertex and breakpoint columns
+
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+
+IterationVertex <- ddply(MC_out, .(Iteration,Lifestage), Quad_Func)
+
+IterationVertex<-cbind(IterationVertex, IterationBreak[,3])
+# extract the std deviation around the vertices for each life stage
+IterationVertexSD <- IterationVertex %>%
+  #group_by(Lifestage) %>%
+  summarize(Standard_Deviation = sd(Temperature))
+
+
+colnames(IterationVertex)<-c("Iteration", "Lifestage", "QV_Temperature", "BP_Temperature")
+```
+  
+
+
+
+
+```{r, echo=FALSE, warning=FALSE, fig.height = 5, fig.width = 7, fig.align = "center"}
+##MAIN PLOT 2 - can add inset of the MC sampling or Tpref curves if wanted
+  
+#tiff('/Users/trueman/Desktop/R scripts/OtoMet/Tuna/Fig_2A.tiff',width = 480, height = 480, units = "px", compression="none", res=300)
+levels(MC_out$Origin)[match("no result",levels(MC_out$Origin))] <- "Unk"
+levels(MC_out$Origin)[match("",levels(MC_out$Origin))] <- "Unk"
+
+
+Temp_Cresp_SubYear<-AZTI_All_TempCresp_Caught %+% subset(MC_out, Lifestage %in% c("sub_yearling"))+
+ # annotation_custom(ggplotGrob(subyear_iteration), xmin = 27.7, xmax = 33.2, 
+   #                    ymin = 0.605, ymax = 0.71)+
+                         geom_point(data=data[data$age_group=="sub_yearling",], aes(x=Temp, y=Cresp), color="black", size=0.5, show.legend=FALSE)+
+                    geom_segment(aes(x = 22.5, y = (as.numeric(AgeBreak_wide[1,3])+(as.numeric(AgeBreak_wide[1,4])*22.5)), xend =as.numeric(AgeBreak_wide[1,2]), yend = (as.numeric(AgeBreak_wide[1,3]) + (as.numeric(AgeBreak_wide[1,4])*as.numeric(AgeBreak_wide[1,2])))), color="#7E6148FF") +
+                     geom_segment(aes(x = as.numeric(AgeBreak_wide[1,2]), y = (as.numeric(AgeBreak_wide[1,3])+(as.numeric(AgeBreak_wide[1,4])*as.numeric(AgeBreak_wide[1,2]))), xend = 31, yend =(as.numeric(AgeBreak_wide[1,3])+(as.numeric(AgeBreak_wide[1,4])*as.numeric(AgeBreak_wide[1,2])))+(as.numeric(AgeBreak_wide[1,5])*(31-as.numeric(AgeBreak_wide[1,2])))   ), color="#7E6148FF")+
+   stat_smooth(aes(Temperature, Cresp),method = "lm", formula = y ~ x + I(x^2), size = 1, color="black", se=TRUE, show.legend = FALSE) +
+  geom_text(x=23, y=0.68, label="A", size=10, color="black")
+
+dev.off()
+                                                         
+
+Temp_Cresp_Year<-AZTI_All_TempCresp_Caught %+% subset(MC_out, Lifestage %in% c("yearling"))+
+  #   annotation_custom(ggplotGrob(yearling_iteration), xmin = 21.5, xmax = 27, 
+   #                    ymin = 0.605, ymax = 0.71)+
+    geom_point(data=data[data$age_group=="yearling",], aes(x=Temp, y=Cresp), color="black", size=0.5, show.legend=FALSE)+
+                      geom_segment(aes(x = 22.5, y = (as.numeric(AgeBreak_wide[2,3])+(as.numeric(AgeBreak_wide[2,4])*22.5)), xend = as.numeric(AgeBreak_wide[2,2]), yend = (as.numeric(AgeBreak_wide[2,3])+(as.numeric(AgeBreak_wide[2,4])*as.numeric(AgeBreak_wide[2,2])))), color="#7E6148FF")+
+                     geom_segment(aes(x = as.numeric(AgeBreak_wide[2,2]), y = (as.numeric(AgeBreak_wide[2,3])+(as.numeric(AgeBreak_wide[2,4])*as.numeric(AgeBreak_wide[2,2]))), xend = 31, yend =(as.numeric(AgeBreak_wide[2,3])+(as.numeric(AgeBreak_wide[2,4])*as.numeric(AgeBreak_wide[2,2])))+(as.numeric(AgeBreak_wide[2,5])*(31-as.numeric(AgeBreak_wide[2,2])))   ), color="#7E6148FF")+
+   stat_smooth(aes(Temperature, Cresp),method = "lm", formula = y ~ x + I(x^2), size = 1, color="black", se=TRUE, show.legend = FALSE) +
+    geom_text(x=23, y=0.68, label="B", size=10, color="black")
+
+
+
+
+Temp_Cresp_2Year_3Mo<-AZTI_All_TempCresp_Origin %+% subset(MC_out, Lifestage %in% c("post_2yr_3"))+
+     # annotation_custom(ggplotGrob(post2Yr_3mo_iteration), xmin = 27.7, xmax = 33.2, 
+      #                 ymin = 0.605, ymax = 0.71)+     
+                           geom_point(data=data[data$age_group=="post_2yr_3",], aes(x=Temp, y=Cresp), color="black", size=0.5)+
+geom_segment(aes(x = 22.5, y = (as.numeric(AgeBreak_wide[3,3])+(as.numeric(AgeBreak_wide[3,4])*22.5)), xend = as.numeric(AgeBreak_wide[3,2]), yend = (as.numeric(AgeBreak_wide[3,3])+(as.numeric(AgeBreak_wide[3,4])*as.numeric(AgeBreak_wide[3,2])))), color="#7E6148FF")+
+                     geom_segment(aes(x = as.numeric(AgeBreak_wide[3,2]), y = (as.numeric(AgeBreak_wide[3,3])+(as.numeric(AgeBreak_wide[3,4])*as.numeric(AgeBreak_wide[3,2]))), xend = 31, yend =(as.numeric(AgeBreak_wide[3,3])+(as.numeric(AgeBreak_wide[3,4])*as.numeric(AgeBreak_wide[3,2])))+(as.numeric(AgeBreak_wide[3,5])*(31-as.numeric(AgeBreak_wide[3,2])))   ), color="#7E6148FF")+
+   stat_smooth(aes(Temperature, Cresp),method = "lm", formula = y ~ x + I(x^2), size = 1, color="black", se=TRUE) +
+    geom_text(x=23, y=0.68, label="C", size=10, color="black")
+
+
+
+
+
+Temp_Cresp_2Year_12Mo<-AZTI_All_TempCresp_Origin %+% subset(MC_out, Lifestage %in% c("post_2yr"))+
+  #     annotation_custom(ggplotGrob(post2Yr_iteration), xmin = 21.5, xmax = 27, 
+   #                    ymin = 0.605, ymax = 0.71)+
+                             geom_point(data=data[data$age_group=="post_2yr",], aes(x=Temp, y=Cresp), color="black", size=0.5)+
+              geom_segment(aes(x = 22.5, y = (as.numeric(AgeBreak_wide[4,3])+(as.numeric(AgeBreak_wide[4,4])*22.5)), xend = as.numeric(AgeBreak_wide[4,2]), yend = (as.numeric(AgeBreak_wide[4,3])+(as.numeric(AgeBreak_wide[4,4])*as.numeric(AgeBreak_wide[4,2])))), color="#7E6148FF")+
+                     geom_segment(aes(x = as.numeric(AgeBreak_wide[4,2]), y = (as.numeric(AgeBreak_wide[4,3])+(as.numeric(AgeBreak_wide[4,4])*as.numeric(AgeBreak_wide[4,2]))), xend = 31, yend =(as.numeric(AgeBreak_wide[4,3])+(as.numeric(AgeBreak_wide[4,4])*as.numeric(AgeBreak_wide[4,2])))+(as.numeric(AgeBreak_wide[4,5])*(31-as.numeric(AgeBreak_wide[4,2])))  ), color="#7E6148FF")+
+   stat_smooth(aes(Temperature, Cresp),method = "lm", formula = y ~ x + I(x^2), size = 1, color="black", se=TRUE) +
+    geom_text(x=23, y=0.68, label="D", size=10, color="black")
+
+
+
+
+
+
+(Temp_Cresp_SubYear+Temp_Cresp_Year)/(Temp_Cresp_2Year_3Mo+Temp_Cresp_2Year_12Mo)
+
+
+#dev.off()
+
+```
+
+
